@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
@@ -13,6 +14,16 @@ QUARTER_MAP = {
     'Q3-2025': ['2025-07', '2025-08', '2025-09'],
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
 }
+
+# Restock delivery lead time (in days) keyed by demand trend: rising demand is
+# expedited, falling demand is deprioritized. Used to set expected_delivery on
+# submitted restock orders.
+LEAD_TIME_BY_TREND = {
+    'increasing': 7,
+    'stable': 14,
+    'decreasing': 21,
+}
+DEFAULT_LEAD_TIME_DAYS = 14
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
@@ -120,6 +131,16 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_price: float
+    trend: Optional[str] = None
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
+
 # API endpoints
 @app.get("/")
 def root():
@@ -160,6 +181,61 @@ def get_order(order_id: str):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+@app.post("/api/restock-orders", response_model=Order, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Create a restocking order from recommended items.
+
+    Builds an Order with status 'Submitted' and appends it to the in-memory
+    orders list, so it surfaces in the Orders view alongside seeded orders.
+    Delivery lead time varies by each item's demand trend; the order's
+    expected_delivery reflects its slowest item (the order completes when the
+    last item lands).
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Restock order must contain at least one item")
+
+    now = datetime.now()
+
+    # The order is only complete once its slowest item arrives, so expected
+    # delivery uses the maximum trend-based lead time across all line items.
+    max_lead_days = max(
+        LEAD_TIME_BY_TREND.get((item.trend or '').lower(), DEFAULT_LEAD_TIME_DAYS)
+        for item in request.items
+    )
+    expected_delivery = now + timedelta(days=max_lead_days)
+
+    order_items = [
+        {
+            "sku": item.sku,
+            "name": item.name,
+            "quantity": item.quantity,
+            "unit_price": item.unit_price,
+        }
+        for item in request.items
+    ]
+    total_value = round(sum(item.quantity * item.unit_price for item in request.items), 2)
+
+    # Sequential restock order number, independent of the seeded ORD-2025 series.
+    restock_count = sum(1 for o in orders if o.get("order_number", "").startswith("ORD-RESTOCK-"))
+    seq = restock_count + 1
+
+    new_order = {
+        "id": f"restock-{seq}",
+        "order_number": f"ORD-RESTOCK-{seq:04d}",
+        "customer": "Internal Restocking",
+        "items": order_items,
+        "status": "Submitted",
+        "order_date": now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "expected_delivery": expected_delivery.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_value": total_value,
+        "actual_delivery": None,
+        "warehouse": None,
+        "category": None,
+    }
+
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/demand", response_model=List[DemandForecast])
 def get_demand_forecasts():
